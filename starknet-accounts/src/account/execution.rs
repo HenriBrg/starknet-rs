@@ -7,7 +7,7 @@ use crate::ExecutionEncoder;
 use starknet_core::{
     crypto::compute_hash_on_elements,
     types::{
-        BroadcastedInvokeTransaction, BroadcastedInvokeTransactionV1,
+        BlockId, BlockTag, BroadcastedInvokeTransaction, BroadcastedInvokeTransactionV1,
         BroadcastedInvokeTransactionV3, BroadcastedTransaction, Call, DataAvailabilityMode,
         FeeEstimate, Felt, InvokeTransactionResult, ResourceBounds, ResourceBoundsMapping,
         SimulatedTransaction, SimulationFlag, SimulationFlagForEstimateFee,
@@ -198,6 +198,21 @@ where
         self.estimate_fee_with_nonce(nonce).await
     }
 
+    /// ! Custom estimate_fee_pending
+    pub async fn estimate_fee_pending(&self) -> Result<FeeEstimate, AccountError<A::SignError>> {
+        // Resolves nonce
+        let nonce = match self.nonce {
+            Some(value) => value,
+            None => self
+                .account
+                .get_nonce()
+                .await
+                .map_err(AccountError::Provider)?,
+        };
+
+        self.estimate_fee_with_nonce_pending(nonce).await // ! ----- Custom Method -----
+    }
+
     /// Simulates the transaction from a [`Provider`]. Transaction validation and fee transfer can
     /// be skipped.
     pub async fn simulate(
@@ -217,6 +232,26 @@ where
 
         self.simulate_with_nonce(nonce, skip_validate, skip_fee_charge)
             .await
+    }
+
+    /// ! Custom simulate_pending
+    pub async fn simulate_pending(
+        &self,
+        skip_validate: bool,
+        skip_fee_charge: bool,
+    ) -> Result<SimulatedTransaction, AccountError<A::SignError>> {
+        // Resolves nonce
+        let nonce = match self.nonce {
+            Some(value) => value,
+            None => self
+                .account
+                .get_nonce()
+                .await
+                .map_err(AccountError::Provider)?,
+        };
+
+        self.simulate_with_nonce_pending(nonce, skip_validate, skip_fee_charge)
+            .await // ! ----- Custom Method -----
     }
 
     /// Signs and broadcasts the transaction to the network.
@@ -306,6 +341,46 @@ where
             .map_err(AccountError::Provider)
     }
 
+    /// ! Custom estimate_fee_with_nonce_pending
+    pub async fn estimate_fee_with_nonce_pending(
+        &self,
+        nonce: Felt,
+    ) -> Result<FeeEstimate, AccountError<A::SignError>> {
+        let skip_signature = self
+            .account
+            .is_signer_interactive(SignerInteractivityContext::Execution { calls: &self.calls });
+
+        let prepared = PreparedExecutionV1 {
+            account: self.account,
+            inner: RawExecutionV1 {
+                calls: self.calls.clone(),
+                nonce,
+                max_fee: Felt::ZERO,
+            },
+        };
+        let invoke = prepared
+            .get_invoke_request(true, skip_signature)
+            .await
+            .map_err(AccountError::Signing)?;
+
+        self.account
+            .provider()
+            .estimate_fee_single(
+                BroadcastedTransaction::Invoke(BroadcastedInvokeTransaction::V1(invoke)),
+                if skip_signature {
+                    // Validation would fail since real signature was not requested
+                    vec![SimulationFlagForEstimateFee::SkipValidate]
+                } else {
+                    // With the correct signature in place, run validation for accurate results
+                    vec![]
+                },
+                // self.account.block_id(),      // ! Removed
+                BlockId::Tag(BlockTag::Pending), // ! Custom change
+            )
+            .await
+            .map_err(AccountError::Provider)
+    }
+
     async fn simulate_with_nonce(
         &self,
         nonce: Felt,
@@ -351,6 +426,60 @@ where
             .provider()
             .simulate_transaction(
                 self.account.block_id(),
+                BroadcastedTransaction::Invoke(BroadcastedInvokeTransaction::V1(invoke)),
+                &flags,
+            )
+            .await
+            .map_err(AccountError::Provider)
+    }
+
+    /// ! Custom simulate_with_nonce_pending
+    pub async fn simulate_with_nonce_pending(
+        &self,
+        nonce: Felt,
+        skip_validate: bool,
+        skip_fee_charge: bool,
+    ) -> Result<SimulatedTransaction, AccountError<A::SignError>> {
+        let skip_signature = if self
+            .account
+            .is_signer_interactive(SignerInteractivityContext::Execution { calls: &self.calls })
+        {
+            // If signer is interactive, we would try to minimize signing requests. However, if the
+            // caller has decided to not skip validation, it's best we still request a real
+            // signature, as otherwise the simulation would most likely fail.
+            skip_validate
+        } else {
+            // Signing with non-interactive signers is cheap so always request signatures.
+            false
+        };
+
+        let prepared = PreparedExecutionV1 {
+            account: self.account,
+            inner: RawExecutionV1 {
+                calls: self.calls.clone(),
+                nonce,
+                max_fee: self.max_fee.unwrap_or_default(),
+            },
+        };
+        let invoke = prepared
+            .get_invoke_request(true, skip_signature)
+            .await
+            .map_err(AccountError::Signing)?;
+
+        let mut flags = vec![];
+
+        if skip_validate {
+            flags.push(SimulationFlag::SkipValidate);
+        }
+        if skip_fee_charge {
+            flags.push(SimulationFlag::SkipFeeCharge);
+        }
+
+        self.account
+            .provider()
+            .simulate_transaction(
+                // self.account.block_id(),      // ! Removed
+                BlockId::Tag(BlockTag::Pending), // ! Custom change
                 BroadcastedTransaction::Invoke(BroadcastedInvokeTransaction::V1(invoke)),
                 &flags,
             )
